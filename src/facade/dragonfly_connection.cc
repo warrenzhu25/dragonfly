@@ -856,6 +856,14 @@ void Connection::OnPostMigrateThread() {
     MaybeEnableRecvMultishot();
     socket_->RegisterOnRecv(
         [this](const FiberSocketBase::RecvNotification& n) { OnRecvNotification(n); });
+
+    // TLS uses the pull model (no multishot), so a fresh RegisterOnRecv only fires on new socket
+    // activity. Application bytes already buffered inside the TLS engine before the migration would
+    // otherwise go unnoticed until the next POLLIN. Force a read attempt on the next loop iteration
+    // to drain them, mirroring the initial pending_input_ = true in IoLoopV2.
+    if (is_tls_) {
+      pending_input_ = true;
+    }
   }
 
   migration_in_process_ = false;
@@ -1011,10 +1019,13 @@ void Connection::HandleRequests() {
       // this connection.
       http_conn.ReleaseSocket();
     } else {  // non-http
-      ioloop_v2_ =
-          !is_tls_ &&
-          ((protocol_ == Protocol::MEMCACHE && GetFlag(FLAGS_enable_memcache_io_loop_v2)) ||
-           (protocol_ == Protocol::REDIS && GetFlag(FLAGS_enable_resp_io_loop_v2)));
+      // TLS connections are also supported by the V2 loop. The TLS socket exposes the same
+      // event-driven primitives (RegisterOnRecv/TryRecv/TrySend) that V2 relies on; multishot
+      // recv stays disabled for TLS (see MaybeEnableRecvMultishot), so the "pull" model is used.
+      // A concurrent blocking reply-flush can defer a TryRecv (WRITE_IN_PROGRESS), so IoLoopV2
+      // re-attempts a read after each flush for TLS - see the idle-await block there.
+      ioloop_v2_ = (protocol_ == Protocol::MEMCACHE && GetFlag(FLAGS_enable_memcache_io_loop_v2)) ||
+                   (protocol_ == Protocol::REDIS && GetFlag(FLAGS_enable_resp_io_loop_v2));
       pipeline_squashing_v2_ =
           ioloop_v2_ && GetFlag(FLAGS_enable_pipeline_squashing_v2) && protocol_ == Protocol::REDIS;
 
@@ -3527,9 +3538,23 @@ variant<error_code, Connection::ParserStatus> Connection::IoLoopV2() {
         return ec;
       }
 
-      fiber_park_spot_ = FiberParkSpot::kIdleAwait;
-      io_event_.await([this] { return ShouldWakeIdle(); });
-      fiber_park_spot_ = FiberParkSpot::kNone;
+      // TLS-only: the flush above is a blocking write that holds the TLS engine's WRITE_IN_PROGRESS
+      // state while it suspends on the network. A POLLIN that fired during that window ran the recv
+      // callback, but TryRecv had to defer (it returns EAGAIN while a write is in progress) and, in
+      // doing so, cleared pending_input_. Unlike the plaintext path - where the recv callback reads
+      // the bytes straight into io_buf_ during the write - the TLS bytes are still buffered in the
+      // socket/engine and unseen by ShouldWakeIdle(). Re-attempt the read now that the write has
+      // completed (WRITE_IN_PROGRESS is clear) so we don't park while readable data is pending.
+      if (is_tls_) {
+        pending_input_ = true;
+        ReadPendingInput();
+      }
+
+      if (!ShouldWakeIdle()) {
+        fiber_park_spot_ = FiberParkSpot::kIdleAwait;
+        io_event_.await([this] { return ShouldWakeIdle(); });
+        fiber_park_spot_ = FiberParkSpot::kNone;
+      }
     }
 
     phase_ = PROCESS;
