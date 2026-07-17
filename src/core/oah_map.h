@@ -24,22 +24,25 @@ class OAHMap : public OAHTable<OAHPair> {
   // Returns true if added, false if an existing field was updated.
   bool AddOrUpdate(std::string_view field, std::string_view value, uint32_t ttl_sec = UINT32_MAX,
                    bool keepttl = false) {
-    TaggedPtr new_tp = MakePair(field, value, ComputeTtl(field, ttl_sec, keepttl));
-    return AddPairImpl(field, new_tp, /*replace=*/true, nullptr);
+    const ascii::EncodedStr key = ascii::EncodedStr::Make(field);
+    TaggedPtr new_tp = MakePair(key, value, ComputeTtl(key, ttl_sec, keepttl));
+    return AddPairImpl(key, new_tp, /*replace=*/true, nullptr);
   }
 
   // Returns false (no update) if the field already exists.
   bool AddOrSkip(std::string_view field, std::string_view value, uint32_t ttl_sec = UINT32_MAX) {
-    return AddPairImpl(field, MakePair(field, value, ttl_sec), /*replace=*/false, nullptr);
+    const ascii::EncodedStr key = ascii::EncodedStr::Make(field);
+    return AddPairImpl(key, MakePair(key, value, ttl_sec), /*replace=*/false, nullptr);
   }
 
   // Like AddOrUpdate but on update returns the previous entry (RAII-owned; freed on destruction);
   // empty if a new field was added.
   OwnedOAHPair AddOrExchange(std::string_view field, std::string_view value,
                              uint32_t ttl_sec = UINT32_MAX, bool keepttl = false) {
-    TaggedPtr new_tp = MakePair(field, value, ComputeTtl(field, ttl_sec, keepttl));
+    const ascii::EncodedStr key = ascii::EncodedStr::Make(field);
+    TaggedPtr new_tp = MakePair(key, value, ComputeTtl(key, ttl_sec, keepttl));
     TaggedPtr old_tp = 0;
-    AddPairImpl(field, new_tp, /*replace=*/true, &old_tp);
+    AddPairImpl(key, new_tp, /*replace=*/true, &old_tp);
     return OwnedOAHPair(old_tp);
   }
 
@@ -52,7 +55,8 @@ class OAHMap : public OAHTable<OAHPair> {
   OwnedOAHPair Extract(std::string_view field) {
     if (entries_.empty())
       return {};
-    const uint64_t hash = Hash(field);
+    const ascii::EncodedStr key = ascii::EncodedStr::Make(field);
+    const uint64_t hash = Hash(key.content());
     const uint32_t bid = BucketId(hash, capacity_log_);
     const uint64_t ext_hash = CalcExtHash(hash, capacity_log_);
     const LaneMasks masks = ProbeWindowShifted(&entries_[bid], ext_hash << oah::kExtHashShift);
@@ -61,7 +65,7 @@ class OAHMap : public OAHTable<OAHPair> {
     TaggedPtr* base = entries_.data();
     for (uint32_t cand_bits = masks.candidates; cand_bits; cand_bits &= cand_bits - 1) {
       TaggedPtr* cell = &base[bid + std::countr_zero(cand_bits)];
-      if (OAHPair(*cell).Key() == field) {
+      if (OAHPair(*cell).KeyMatches(key)) {
         matched = cell;
         break;
       }
@@ -69,7 +73,7 @@ class OAHMap : public OAHTable<OAHPair> {
     const uint32_t ext_bid = GetExtensionPoint(bid);
     bool in_vector = false;
     if (!matched && At(ext_bid).IsVector()) {
-      matched = ProbeExtensionVector(ext_bid, field, ext_hash);
+      matched = ProbeExtensionVector(ext_bid, key, ext_hash);
       in_vector = matched != nullptr;
     }
     if (!matched)
@@ -109,11 +113,12 @@ class OAHMap : public OAHTable<OAHPair> {
 
     static thread_local absl::InsecureBitGen rng;
     unsigned index = 0, remaining = count;
+    char buf[ascii::kMaxLen];
     for (auto it = begin(), it_end = end(); remaining && it != it_end; ++it, ++index) {
       double threshold = double(remaining) / (total - index);
       if (absl::Uniform(rng, 0.0, 1.0) <= threshold) {
         OAHPair e = *it;
-        keys.emplace_back(e.Key());
+        keys.emplace_back(DecodeKey(e, buf));
         if (with_value)
           vals.emplace_back(e.Value());
         --remaining;
@@ -122,32 +127,33 @@ class OAHMap : public OAHTable<OAHPair> {
   }
 
  private:
-  uint32_t ComputeTtl(std::string_view field, uint32_t ttl_sec, bool keepttl) {
-    if (keepttl) {
-      auto it = Find(field);
+  uint32_t ComputeTtl(const ascii::EncodedStr& key, uint32_t ttl_sec, bool keepttl) {
+    if (keepttl && !entries_.empty()) {
+      auto it = Find(key);
       if (it != end() && it.HasExpiry() && it.ExpiryTime() > time_now_)
         return it.ExpiryTime() - time_now_;
     }
     return ttl_sec;
   }
 
-  // Creates a pair blob for field/value with a relative ttl, flagging expiry use.
-  TaggedPtr MakePair(std::string_view field, std::string_view value, uint32_t ttl) {
+  // Creates a pair blob for key/value with a relative ttl, flagging expiry use.
+  TaggedPtr MakePair(const ascii::EncodedStr& key, std::string_view value, uint32_t ttl) {
     if (ttl != UINT32_MAX)
       expiration_used_ = true;
-    return OAHPair::Create(field, value, EntryTTL(ttl));
+    return OAHPair::Create(key.content(), key.len(), value, EntryTTL(ttl));
   }
 
   // Map insertion core. On a live duplicate: replace=false destroys new_tp; replace=true swaps it
   // in, returning the old TaggedPtr via *old_out (or destroying it when null). Returns true only on
   // a fresh insert.
-  bool AddPairImpl(std::string_view field, TaggedPtr new_tp, bool replace, TaggedPtr* old_out) {
+  bool AddPairImpl(const ascii::EncodedStr& key, TaggedPtr new_tp, bool replace,
+                   TaggedPtr* old_out) {
     if (size_ >= entries_.size()) [[unlikely]] {
       Reserve(BucketCount() * 2);
     }
     assert(Capacity() >= kDisplacementSize);
 
-    uint64_t hash = Hash(field);
+    uint64_t hash = Hash(key.content());
     auto bucket_id = BucketId(hash, capacity_log_);
     oah::PrefetchRead(entries_.data() + bucket_id);
 
@@ -165,13 +171,13 @@ class OAHMap : public OAHTable<OAHPair> {
     TaggedPtr* base = entries_.data();
     for (uint32_t cand_bits = masks.candidates; cand_bits; cand_bits &= cand_bits - 1) {
       TaggedPtr* cell = &base[bucket_id + std::countr_zero(cand_bits)];
-      if (OAHPair(*cell).Key() == field) {
+      if (OAHPair(*cell).KeyMatches(key)) {
         matched = cell;
         break;
       }
     }
     if (!matched && At(ext_bid).IsVector())
-      matched = ProbeExtensionVector(ext_bid, field, ext_hash);
+      matched = ProbeExtensionVector(ext_bid, key, ext_hash);
 
     if (matched) {
       OAHPair dup(*matched);

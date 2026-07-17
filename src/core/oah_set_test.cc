@@ -14,8 +14,10 @@
 
 #include "base/gtest.h"
 #include "base/logging.h"
+#include "core/detail/bitpacking.h"
 #include "core/mi_memory_resource.h"
 #include "core/page_usage/page_usage_stats.h"
+#include "core/str_codec.h"
 
 extern "C" {
 #include "redis/zmalloc.h"
@@ -24,6 +26,19 @@ extern "C" {
 namespace dfly {
 
 using namespace std;
+using ascii::EncodedStr;
+
+// Encodes a logical key the way OAHSet does, then serializes it into an entry blob.
+static uint64_t CreateEntry(string_view key, uint32_t expiry = UINT32_MAX) {
+  const EncodedStr ek = EncodedStr::Make(key);
+  return OAHEntry::Create(ek.content(), ek.len(), expiry);
+}
+
+// Decodes an entry's logical key (production does this at the table level, via OAHSet::DecodeKey).
+static string KeyOf(OAHEntry e) {
+  char buf[ascii::kMaxLen];
+  return string(OAHSet::DecodeKey(e, buf));
+}
 
 class OAHSetTest : public ::testing::Test {
  protected:
@@ -62,6 +77,133 @@ static string random_string(mt19937& rand, unsigned len) {
   }
 
   return ret;
+}
+
+TEST(OAHAsciiCodec, PackUnpackRoundtrip) {
+  // Pack/Unpack are exercised directly here, including the short lengths that Encodable rejects.
+  for (uint32_t len : {1u, 2u, 7u, 8u, 9u, 15u, 16u, 63u, 64u, 100u, 127u, 128u}) {
+    string s;
+    for (uint32_t i = 0; i < len; ++i)
+      s.push_back(static_cast<char>('a' + (i % 26)));
+    ASSERT_EQ(ascii::PackedSize(len), (len * 7u + 7u) / 8u);
+    char packed[ascii::kMaxPacked];
+    ascii::Pack(s, packed);
+    char out[ascii::kMaxLen];
+    ascii::Unpack(packed, len, out);
+    EXPECT_EQ(string_view(out, len), string_view(s)) << len;
+  }
+}
+
+TEST(OAHAsciiCodec, EncodableBoundaries) {
+  EXPECT_FALSE(ascii::Encodable(""));                // empty stays raw
+  EXPECT_FALSE(ascii::Encodable(string(7, 'x')));    // < 8 bytes: packing saves nothing
+  EXPECT_TRUE(ascii::Encodable(string(8, 'x')));     // smallest length worth packing
+  EXPECT_TRUE(ascii::Encodable(string(128, 'x')));   // largest encodable length
+  EXPECT_FALSE(ascii::Encodable(string(129, 'x')));  // length > 128
+  string hi(8, 'a');
+  hi.push_back(static_cast<char>(0x80));  // high bit set
+  EXPECT_FALSE(ascii::Encodable(hi));
+  string hi2(10, 'a');
+  hi2[9] = static_cast<char>(0xFF);
+  EXPECT_FALSE(ascii::Encodable(hi2));  // non-ascii in the SWAR-checked head
+}
+
+TEST(OAHKeyCodec, HeaderContentMatchesDecode) {
+  auto check = [](const string& key) {
+    const ascii::EncodedStr ek = ascii::EncodedStr::Make(key);
+    const uint32_t hdr = oah::size::FieldSize(ek.len());
+    vector<char> blob(hdr + ek.content().size() + 1, 0);
+    const uint8_t encoded_bit = ek.encoded() * oah::key::kEncodedBit;
+    const uint32_t fs = oah::key::WriteHeader(encoded_bit, ek.len(), blob.data());
+    EXPECT_EQ(fs, hdr) << key.size();
+    memcpy(blob.data() + fs, ek.content().data(), ek.content().size());
+
+    const oah::key::Header h = oah::key::ReadHeader(blob.data());
+    EXPECT_EQ(h.field_size, fs) << key.size();
+    EXPECT_EQ(h.len, key.size()) << key.size();
+    EXPECT_EQ(h.encoded, ascii::Encodable(key)) << key.size();
+    EXPECT_EQ(h.content_size, ek.content().size()) << key.size();
+
+    const char* content = blob.data() + h.field_size;
+    const oah::key::Stored stored{h, content};
+    char out[600];
+    EXPECT_EQ(oah::key::Decode(stored, out), string_view(key)) << key.size();
+
+    EXPECT_TRUE(oah::key::Matches(h, content, ek)) << key.size();
+
+    const ascii::EncodedStr other = ascii::EncodedStr::Make(key + "Z");
+    EXPECT_FALSE(oah::key::Matches(h, content, other)) << key.size();
+  };
+  for (uint32_t len : {0u, 1u, 7u, 8u, 63u, 64u, 127u, 128u, 500u})
+    check(string(len, 'a'));
+
+  string non_ascii = "abc";
+  non_ascii.push_back(static_cast<char>(0x80));
+  check(non_ascii);
+}
+
+// Cross-check the OAH codec against Dragonfly's production ascii bit-packer (detail::bitpacking).
+// Both pack full 8-byte groups LSB-first identically; they differ only in the <8-byte tail (OAH
+// 7-bit-packs it, detail copies it verbatim -- same size since ceil(7k/8)==k for k<8). So the
+// packed bytes and the reference unpacker agree exactly on multiples of 8 (no tail).
+TEST(OAHAsciiCodec, MatchesDetailBitpacking) {
+  for (uint32_t len = 8; len <= ascii::kMaxLen; len += 8) {
+    string s;
+    for (uint32_t i = 0; i < len; ++i)
+      s.push_back(static_cast<char>((i * 61 + 7) & 0x7F));
+    const size_t packed = ascii::PackedSize(len);
+
+    char mine[ascii::kMaxPacked];
+    vector<uint8_t> ref(packed + 16, 0);
+    ascii::Pack(s, mine);
+    detail::ascii_pack(s.data(), len, ref.data());
+    EXPECT_EQ(string_view(mine, packed), string_view(reinterpret_cast<char*>(ref.data()), packed))
+        << "len=" << len;
+
+    char back[ascii::kMaxLen];
+    detail::ascii_unpack(reinterpret_cast<const uint8_t*>(mine), len, back);
+    EXPECT_EQ(string_view(back, len), string_view(s)) << "len=" << len;
+  }
+}
+
+TEST_F(OAHSetTest, AsciiEncoding) {
+  string ascii_key(80, 'a');                // 80 ascii chars -> 70 packed bytes
+  string boundary(128, 'b');                // largest ascii-encodable key
+  string too_long(129, 'c');                // one over -> raw
+  string non_ascii(80, 'd');                //
+  non_ascii[40] = static_cast<char>(0xC3);  // a non-ascii byte -> raw
+
+  for (string* k : {&ascii_key, &boundary, &too_long, &non_ascii})
+    EXPECT_TRUE(ss_->Add(*k)) << k->size();
+
+  // Duplicate detection runs in the encoded state.
+  EXPECT_FALSE(ss_->Add(ascii_key));
+  EXPECT_FALSE(ss_->Add(boundary));
+
+  // Encodable keys are packed; the others stay raw.
+  auto it = ss_->Find(ascii_key);
+  ASSERT_NE(it, ss_->end());
+  EXPECT_EQ(it->KeyContent().size(), ascii::PackedSize(80));
+  EXPECT_LT(it->KeyContent().size(), ascii_key.size());
+  EXPECT_EQ(ss_->Find(boundary)->KeyContent().size(), ascii::PackedSize(128));
+  EXPECT_EQ(ss_->Find(too_long)->KeyContent().size(), too_long.size());
+  EXPECT_EQ(ss_->Find(non_ascii)->KeyContent().size(), non_ascii.size());
+
+  // Lookups distinguish keys that would pack to the same byte count but differ in length.
+  EXPECT_FALSE(ss_->Contains(string(79, 'a')));
+  EXPECT_FALSE(ss_->Contains(string(81, 'a')));
+
+  // Iteration reconstructs the logical keys.
+  unordered_set<string> seen;
+  for (auto e = ss_->begin(); e != ss_->end(); ++e)
+    seen.insert(string{KeyOf(*e)});
+  for (string* k : {&ascii_key, &boundary, &too_long, &non_ascii})
+    EXPECT_TRUE(seen.count(*k)) << k->size();
+
+  for (string* k : {&ascii_key, &boundary, &too_long, &non_ascii}) {
+    EXPECT_TRUE(ss_->Erase(*k)) << k->size();
+    EXPECT_FALSE(ss_->Contains(*k)) << k->size();
+  }
 }
 
 TEST_F(OAHSetTest, PtrVectorLinearThenDouble) {
@@ -135,10 +277,10 @@ TEST_F(OAHSetTest, PtrVectorDestroysAllElements) {
 }
 
 TEST_F(OAHSetTest, OAHEntryTest) {
-  uint64_t bits = OAHEntry::Create("0123456789", 2);
+  uint64_t bits = CreateEntry("0123456789", 2);
   OAHEntry test(bits);
 
-  EXPECT_EQ(test.Key(), "0123456789"sv);
+  EXPECT_EQ(KeyOf(test), "0123456789"sv);
   EXPECT_EQ(test.GetExpiry(), 2);
 
   OAHEntry::Destroy(test.Release());
@@ -156,9 +298,9 @@ TEST_F(OAHSetTest, KeySizeEncoding) {
     keys.push_back(key);
 
     for (uint32_t expiry : {UINT32_MAX, 7u}) {
-      uint64_t bits = OAHEntry::Create(key, expiry);
+      uint64_t bits = CreateEntry(key, expiry);
       OAHEntry e(bits);
-      EXPECT_EQ(e.Key(), key);
+      EXPECT_EQ(KeyOf(e), key);
       EXPECT_EQ(e.HasExpiry(), expiry != UINT32_MAX);
       if (expiry != UINT32_MAX) {
         EXPECT_EQ(e.GetExpiry(), expiry);
@@ -184,13 +326,14 @@ TEST_F(OAHSetTest, OAHPtrInsertRemove) {
   // the leftover collision array explicitly at the end.
   uint64_t slot = 0;
   OAHPtr<OAHEntry> test{slot};
-  test.Assign(OAHEntry::Create("0123456789", 2));
+  test.Assign(CreateEntry("0123456789", 2));
 
-  EXPECT_EQ(test[0].Key(), "0123456789"sv);
+  EXPECT_EQ(KeyOf(test[0]), "0123456789"sv);
   EXPECT_EQ(test[0].GetExpiry(), 2);
 
-  EXPECT_EQ(test.Insert(OAHEntry::Create("123456789")), 16);  // promote to a 2-element vector
-  EXPECT_EQ(test.Insert(OAHEntry::Create("23456789")), 16);   // linear grow 2 -> 4
+  EXPECT_EQ(test.Insert(CreateEntry("123456789")),
+            16);                                        // promote to a 2-element vector
+  EXPECT_EQ(test.Insert(CreateEntry("23456789")), 16);  // linear grow 2 -> 4
 
   uint64_t removed0 = test.Remove(0);
   EXPECT_TRUE(removed0);
@@ -199,8 +342,8 @@ TEST_F(OAHSetTest, OAHPtrInsertRemove) {
 
   uint64_t removed2 = test.Remove(2);
   uint64_t removed1 = test.Remove(1);
-  EXPECT_EQ(OAHEntry(removed2).Key(), "23456789");
-  EXPECT_EQ(OAHEntry(removed1).Key(), "123456789");
+  EXPECT_EQ(KeyOf(OAHEntry(removed2)), "23456789");
+  EXPECT_EQ(KeyOf(OAHEntry(removed1)), "123456789");
   OAHEntry::Destroy(removed2);
   OAHEntry::Destroy(removed1);
 
@@ -221,7 +364,7 @@ TEST_F(OAHSetTest, OAHSetAddFindTest) {
 
   for (const auto& s : test_set) {
     auto e = ss.Find(s);
-    EXPECT_EQ(e->Key(), s);
+    EXPECT_EQ(KeyOf(*e), s);
   }
 
   // ~10000 elements at load factor 1 (grow when size_ >= table size).
@@ -278,7 +421,7 @@ TEST_F(OAHSetTest, NoDuplicateInsertion) {
   std::unordered_set<std::string> seen;
   size_t total = 0;
   for (auto it = ss_->begin(); it != ss_->end(); ++it) {
-    EXPECT_TRUE(seen.insert(std::string(it->Key())).second) << "duplicate: " << it->Key();
+    EXPECT_TRUE(seen.insert(std::string(KeyOf(*it))).second) << "duplicate: " << KeyOf(*it);
     ++total;
   }
   EXPECT_EQ(seen.size(), keys.size());
@@ -407,7 +550,7 @@ TEST_F(OAHSetTest, SimdFindEraseStress) {
   for (const auto& s : live) {
     auto it = ss_->Find(s);
     ASSERT_NE(it, ss_->end()) << s;
-    EXPECT_EQ(it->Key(), s);
+    EXPECT_EQ(KeyOf(*it), s);
     EXPECT_FALSE(it.HasExpiry());
   }
   for (const auto& s : ttl_alive) {
@@ -466,7 +609,8 @@ TEST_F(OAHSetTest, Resizing) {
 
 TEST_F(OAHSetTest, SimpleScan) {
   unordered_set<string_view> info = {"foo", "bar"};
-  unordered_set<string_view> seen;
+  // Key() may hand out a view into a per-thread decode buffer (ascii keys), so copy to retain.
+  unordered_set<string> seen;
 
   for (auto str : info) {
     EXPECT_TRUE(ss_->Add(str));
@@ -476,12 +620,13 @@ TEST_F(OAHSetTest, SimpleScan) {
   do {
     cursor = ss_->Scan(cursor, [&](std::string_view str) {
       EXPECT_TRUE(info.count(str));
-      seen.insert(str);
+      seen.insert(string{str});
     });
   } while (cursor != 0);
 
   EXPECT_EQ(seen.size(), info.size());
-  EXPECT_EQ(seen, info);
+  for (string_view s : info)
+    EXPECT_TRUE(seen.count(string{s})) << s;
 }
 
 // // Ensure REDIS scan guarantees are met
@@ -490,13 +635,14 @@ TEST_F(OAHSetTest, ScanGuarantees) {
   unordered_set<string_view> not_be_seen = {"AAA", "BBB"};
   unordered_set<string_view> maybe_seen = {"AA@@@@@@@@@@@@@@", "AAA@@@@@@@@@@@@@",
                                            "AAAAAAAAA@@@@@@@", "AAAAAAAAAA@@@@@@"};
-  unordered_set<string_view> seen;
+  // Key() may hand out a view into a per-thread decode buffer (ascii keys), so copy to retain.
+  unordered_set<string> seen;
 
   auto scan_callback = [&](std::string_view str) {
     EXPECT_TRUE(to_be_seen.count(str) || maybe_seen.count(str));
     EXPECT_FALSE(not_be_seen.count(str));
     if (to_be_seen.count(str)) {
-      seen.insert(str);
+      seen.insert(string{str});
     }
   };
 
@@ -643,7 +789,7 @@ TEST_F(OAHSetTest, Iteration) {
   }
 
   for (const auto& ptr : *ss_) {
-    std::string str(ptr.Key());
+    std::string str(KeyOf(ptr));
     EXPECT_TRUE(to_insert.count(str));
     to_insert.erase(str);
   }
@@ -685,7 +831,7 @@ TEST_F(OAHSetTest, Ttl) {
   }
   EXPECT_EQ(101u, ss_->UpperBoundSize());
   it = ss_->Find("foo50");
-  EXPECT_EQ("foo50"sv, it->Key());
+  EXPECT_EQ("foo50"sv, KeyOf(*it));
   EXPECT_EQ(2u, it.ExpiryTime());
 
   ss_->set_time(2);
@@ -703,8 +849,8 @@ TEST_F(OAHSetTest, Ttl) {
   EXPECT_FALSE(it.HasExpiry());
 
   for (auto it = ss_->begin(); it != ss_->end(); ++it) {
-    ASSERT_TRUE(absl::StartsWith(it->Key(), "bar")) << it->Key();
-    string str(it->Key());
+    ASSERT_TRUE(absl::StartsWith(KeyOf(*it), "bar")) << KeyOf(*it);
+    string str(KeyOf(*it));
     VLOG(1) << *it;
   }
 }
@@ -744,7 +890,7 @@ TEST_F(OAHSetTest, Fill) {
   ss_->Fill(&s2);
   EXPECT_EQ(s2.UpperBoundSize(), ss_->UpperBoundSize());
   for (const auto& s : *ss_) {
-    EXPECT_TRUE(s2.Contains(s.Key()));
+    EXPECT_TRUE(s2.Contains(KeyOf(s)));
   }
 }
 
@@ -833,9 +979,9 @@ TEST_F(OAHSetTest, ReallocIfNeededVectorEntry) {
   // OAHPtr is a non-owning view; the test owns `slot` and frees it at the end.
   uint64_t slot = 0;
   OAHPtr<OAHEntry> e{slot};
-  e.Assign(OAHEntry::Create("first_entry_payload"));
-  (void)e.Insert(OAHEntry::Create("second_entry_payload"));
-  (void)e.Insert(OAHEntry::Create("third_entry_payload"));
+  e.Assign(CreateEntry("first_entry_payload"));
+  (void)e.Insert(CreateEntry("second_entry_payload"));
+  (void)e.Insert(CreateEntry("third_entry_payload"));
   ASSERT_TRUE(e.IsVector());
 
   // Snapshot inner-entry buffer pointers so we can assert each one moved.
@@ -864,7 +1010,7 @@ TEST_F(OAHSetTest, ReallocIfNeededVectorEntry) {
   for (uint32_t i = 0; i < vec.Size(); ++i) {
     OAHEntry cell(vec[i]);
     if (cell) {
-      seen.insert(std::string(cell.Key()));
+      seen.insert(std::string(KeyOf(cell)));
       new_inner_ptrs.push_back(cell.Raw());
     }
   }
@@ -961,7 +1107,7 @@ TEST_F(OAHSetTest, GetRandomMemberSingle) {
   EXPECT_TRUE(ss_->Add("only"sv));
   auto it = ss_->GetRandomMember();
   ASSERT_NE(it, ss_->end());
-  EXPECT_EQ(it->Key(), "only"sv);
+  EXPECT_EQ(KeyOf(*it), "only"sv);
 }
 
 TEST_F(OAHSetTest, GetRandomMemberSkipsExpired) {
@@ -974,7 +1120,7 @@ TEST_F(OAHSetTest, GetRandomMemberSkipsExpired) {
     auto it = ss_->GetRandomMember();
     if (it == ss_->end())
       continue;
-    EXPECT_EQ(it->Key(), "alive"sv);
+    EXPECT_EQ(KeyOf(*it), "alive"sv);
   }
 }
 
@@ -1059,7 +1205,7 @@ void BM_Clone(benchmark::State& state) {
   ss2.Reserve(ss1.UpperBoundSize());
   while (state.KeepRunning()) {
     for (auto src : ss1) {
-      ss2.Add(src.Key());
+      ss2.Add(KeyOf(src));
     }
     state.PauseTiming();
     ss2.Clear();
@@ -1497,5 +1643,99 @@ TEST_F(OAHSetTest, ScanWithShrinkBetweenCalls) {
   }
   EXPECT_EQ(seen.size(), must_see.size()) << "Should see exactly all original elements";
 }
+
+// ---------------------------------------------------------------------------
+// Pack/unpack micro-benchmarks: OAH codec (PEXT/PDEP) vs Dragonfly's production
+// detail::bitpacking (scalar + two SSE variants). Lengths cover OAH's key range
+// (<=128) plus 1000 to show how the SSE variants scale on long strings.
+static std::string BenchAscii(unsigned len) {
+  std::string s(len, 'a');
+  for (unsigned i = 0; i < len; ++i)
+    s[i] = static_cast<char>('a' + (i % 26));
+  return s;
+}
+
+void BM_Pack_OAH(benchmark::State& state) {
+  const std::string s = BenchAscii(state.range(0));
+  std::vector<char> out(s.size() + 64);
+  for (auto _ : state) {
+    benchmark::DoNotOptimize(s.data());
+    ascii::Pack(s, out.data());
+    benchmark::DoNotOptimize(out.data());
+  }
+}
+BENCHMARK(BM_Pack_OAH)->Arg(16)->Arg(64)->Arg(128)->Arg(1000);
+
+void BM_Pack_Scalar(benchmark::State& state) {
+  const std::string s = BenchAscii(state.range(0));
+  std::vector<uint8_t> out(s.size() + 64);
+  for (auto _ : state) {
+    benchmark::DoNotOptimize(s.data());
+    detail::ascii_pack(s.data(), s.size(), out.data());
+    benchmark::DoNotOptimize(out.data());
+  }
+}
+BENCHMARK(BM_Pack_Scalar)->Arg(16)->Arg(64)->Arg(128)->Arg(1000);
+
+void BM_Pack_Simd1(benchmark::State& state) {
+  const std::string s = BenchAscii(state.range(0));
+  std::vector<uint8_t> out(s.size() + 64);
+  for (auto _ : state) {
+    benchmark::DoNotOptimize(s.data());
+    detail::ascii_pack_simd(s.data(), s.size(), out.data());
+    benchmark::DoNotOptimize(out.data());
+  }
+}
+BENCHMARK(BM_Pack_Simd1)->Arg(16)->Arg(64)->Arg(128)->Arg(1000);
+
+void BM_Pack_Simd2(benchmark::State& state) {
+  const std::string s = BenchAscii(state.range(0));
+  std::vector<uint8_t> out(s.size() + 64);
+  for (auto _ : state) {
+    benchmark::DoNotOptimize(s.data());
+    detail::ascii_pack_simd2(s.data(), s.size(), out.data());
+    benchmark::DoNotOptimize(out.data());
+  }
+}
+BENCHMARK(BM_Pack_Simd2)->Arg(16)->Arg(64)->Arg(128)->Arg(1000);
+
+void BM_Unpack_OAH(benchmark::State& state) {
+  const std::string s = BenchAscii(state.range(0));
+  std::vector<char> packed(s.size() + 64);
+  ascii::Pack(s, packed.data());
+  std::vector<char> out(s.size() + 64);
+  for (auto _ : state) {
+    benchmark::DoNotOptimize(packed.data());
+    ascii::Unpack(packed.data(), s.size(), out.data());
+    benchmark::DoNotOptimize(out.data());
+  }
+}
+BENCHMARK(BM_Unpack_OAH)->Arg(16)->Arg(64)->Arg(128)->Arg(1000);
+
+void BM_Unpack_Scalar(benchmark::State& state) {
+  const std::string s = BenchAscii(state.range(0));
+  std::vector<uint8_t> packed(s.size() + 64);
+  detail::ascii_pack(s.data(), s.size(), packed.data());
+  std::vector<char> out(s.size() + 64);
+  for (auto _ : state) {
+    benchmark::DoNotOptimize(packed.data());
+    detail::ascii_unpack(packed.data(), s.size(), out.data());
+    benchmark::DoNotOptimize(out.data());
+  }
+}
+BENCHMARK(BM_Unpack_Scalar)->Arg(16)->Arg(64)->Arg(128)->Arg(1000);
+
+void BM_Unpack_Simd(benchmark::State& state) {
+  const std::string s = BenchAscii(state.range(0));
+  std::vector<uint8_t> packed(s.size() + 64);
+  detail::ascii_pack(s.data(), s.size(), packed.data());
+  std::vector<char> out(s.size() + 64);
+  for (auto _ : state) {
+    benchmark::DoNotOptimize(packed.data());
+    detail::ascii_unpack_simd(packed.data(), s.size(), out.data());
+    benchmark::DoNotOptimize(out.data());
+  }
+}
+BENCHMARK(BM_Unpack_Simd)->Arg(16)->Arg(64)->Arg(128)->Arg(1000);
 
 }  // namespace dfly

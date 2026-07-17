@@ -50,8 +50,9 @@ class OAHSet : public OAHTable<OAHEntry> {
     assert(other->entries_.empty());
     other->Reserve(UpperBoundSize());
     other->set_time(time_now());
+    char buf[ascii::kMaxLen];
     for (auto it = begin(), it_end = end(); it != it_end; ++it) {
-      other->Add(it->Key(), it.HasExpiry() ? it.ExpiryTime() - time_now() : UINT32_MAX);
+      other->Add(DecodeKey(*it, buf), it.HasExpiry() ? it.ExpiryTime() - time_now() : UINT32_MAX);
     }
   }
 
@@ -62,7 +63,8 @@ class OAHSet : public OAHTable<OAHEntry> {
     }
     assert(Capacity() >= kDisplacementSize);
 
-    uint64_t hash = Hash(str);
+    const ascii::EncodedStr key = ascii::EncodedStr::Make(str);
+    uint64_t hash = Hash(key.content());
     auto bucket_id = BucketId(hash, capacity_log_);
     oah::PrefetchRead(entries_.data() + bucket_id);
 
@@ -70,7 +72,7 @@ class OAHSet : public OAHTable<OAHEntry> {
     const uint64_t shifted_ext_hash = ext_hash << oah::kExtHashShift;
 
     const ssize_t mem_before = zmalloc_used_memory_tl;
-    TaggedPtr entry_tagged_ptr = OAHEntry::Create(str, EntryTTL(ttl_sec));
+    TaggedPtr entry_tagged_ptr = OAHEntry::Create(key.content(), key.len(), EntryTTL(ttl_sec));
     OAHEntry(entry_tagged_ptr).SetShiftedExtHash(shifted_ext_hash);  // reuse the shifted value
     if (ttl_sec != UINT32_MAX)
       expiration_used_ = true;
@@ -87,13 +89,13 @@ class OAHSet : public OAHTable<OAHEntry> {
     TaggedPtr* base = entries_.data();
     for (uint32_t cand_bits = masks.candidates; cand_bits; cand_bits &= cand_bits - 1) {
       TaggedPtr* cell = &base[bucket_id + std::countr_zero(cand_bits)];
-      if (OAHEntry(*cell).Key() == str) {
+      if (OAHEntry(*cell).KeyMatches(key)) {
         matched = cell;
         break;
       }
     }
     if (!matched && At(ext_bid).IsVector())
-      matched = ProbeExtensionVector(ext_bid, str, ext_hash);
+      matched = ProbeExtensionVector(ext_bid, key, ext_hash);
 
     if (matched) {
       OAHEntry dup(*matched);
@@ -130,14 +132,18 @@ template <typename Fn> auto VisitSet(void* ptr, Fn&& fn) {
 }
 
 // Current member as a string_view from either iterator type. Free functions so
-// generic code (e.g. VisitSet lambdas) can write `Key(it)` uniformly.
+// generic code (e.g. VisitSet lambdas) can write `Key(it)` uniformly. For OAHSet, encoded keys are
+// decoded into a thread-local scratch buffer (valid until the next Key() call on this thread) so
+// the view outlives this call, mirroring StringSet's container-owned view; server callers copy the
+// key before the next iteration.
 inline std::string_view Key(StringSet::iterator it) {
   sds s = *it;
   return {s, sdslen(s)};
 }
 
 inline std::string_view Key(OAHSet::iterator it) {
-  return it->Key();
+  thread_local char buf[ascii::kMaxLen];
+  return OAHSet::DecodeKey(*it, buf);
 }
 
 }  // namespace dfly
