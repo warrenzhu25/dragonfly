@@ -483,6 +483,15 @@ def delete_azure_objects(container, prefix):
         container_client.delete_blob(blob.name)
 
 
+def get_azure_account_name():
+    from azure.storage.blob import BlobServiceClient
+
+    blob_service = BlobServiceClient.from_connection_string(
+        os.environ["AZURE_STORAGE_CONNECTION_STRING"]
+    )
+    return blob_service.account_name
+
+
 @pytest.mark.skipif(
     _missing_azure_test_env(),
     reason="Azure storage container or credentials are not configured",
@@ -493,7 +502,13 @@ async def test_azure_snapshot(async_client, tmp_dir):
     await seeder.run(async_client)
 
     start_capture = await DebugPopulateSeeder.capture(async_client)
-    az_path = "az://" + os.environ["DRAGONFLY_AZURE_CONTAINER"] + str(tmp_dir)
+    az_path = (
+        "https://"
+        + get_azure_account_name()
+        + ".blob.core.windows.net/"
+        + os.environ["DRAGONFLY_AZURE_CONTAINER"]
+        + str(tmp_dir)
+    )
 
     try:
         # save to Azure + flush + load from Azure
