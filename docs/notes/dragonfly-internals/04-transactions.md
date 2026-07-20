@@ -57,33 +57,26 @@ A multi-shard transaction happens in two phases, each phase being one or more ho
 
 ```mermaid
 sequenceDiagram
-    participant C as Coordinator<br/>(connection fiber)
+    participant C as Coordinator
     participant S1 as Shard 1
     participant S3 as Shard 3
-
-    rect rgb(238, 246, 255)
-    note over C,S3: Phase 1 — Schedule (reserve order + record intent)
+    Note over C,S3: Phase 1 - Schedule (reserve order, record intent)
     par
-        C->>S1: reserve slot for TxId, lock key a
+        C->>S1: reserve TxId slot, lock key a
         S1-->>C: ack
     and
-        C->>S3: reserve slot for TxId, lock key b
+        C->>S3: reserve TxId slot, lock key b
         S3-->>C: ack
     end
-    end
-
-    rect rgb(240, 255, 240)
-    note over C,S3: Phase 2 — Execute (run the callback, release)
+    Note over C,S3: Phase 2 - Execute (run callback, then release)
     par
-        C->>S1: run callback on a, then release
+        C->>S1: run callback on a, release
         S1-->>C: ack
     and
-        C->>S3: run callback on b, then release
+        C->>S3: run callback on b, release
         S3-->>C: ack
     end
-    end
-
-    note over C: reply OK to client
+    Note over C: reply OK to client
 ```
 
 **Phase 1, Schedule:** the coordinator reserves the transaction a position in each shard's ordered
@@ -339,35 +332,33 @@ of them gets data — all while preserving strict serializability. The mechanism
 ```mermaid
 sequenceDiagram
     participant C1 as BLPOP coordinator
-    participant S1 as Shard 1 (key X)
-    participant S2 as Shard 2 (key Y)
+    participant S1 as Shard 1 key X
+    participant S2 as Shard 2 key Y
     participant C2 as LPUSH coordinator
-
-    note over C1: BLPOP X Y 0
-    par schedule + check
+    Note over C1: BLPOP X Y 0
+    par check keys
         C1->>S1: is X non-empty?
         S1-->>C1: empty
     and
         C1->>S2: is Y non-empty?
         S2-->>C1: empty
     end
-
-    note over C1: all empty → suspend
-    par register watches (concluding hop)
-        C1->>S1: watch X — leave tx-queue, KEEP locks
-        C1->>S2: watch Y — leave tx-queue, KEEP locks
+    Note over C1: all empty, so suspend
+    par register watches
+        C1->>S1: watch X, leave tx-queue, keep locks
+    and
+        C1->>S2: watch Y, leave tx-queue, keep locks
     end
-    note over C1: fiber blocks; not in any queue,<br/>but still holds intent locks on X and Y
-
-    note over C2: another client: LPUSH Y val
+    Note over C1: fiber blocks, still holds intent locks on X and Y
+    Note over C2: another client runs LPUSH Y val
     C2->>S2: push to Y
-    S2->>C1: notify: woken on key Y
-
-    par pop from wake key (highest priority)
+    S2->>C1: notify, woken on key Y
+    par pop from wake key
         C1->>S1: release locks on X
+    and
         C1->>S2: pop Y, release locks
     end
-    note over C1: return ("Y", "val")
+    Note over C1: return Y and val
 ```
 
 The transaction schedules normally and checks its keys. If any key already has data, it pops and
