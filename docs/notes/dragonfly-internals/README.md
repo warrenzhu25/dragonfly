@@ -45,6 +45,8 @@ works* → *a worked example* → *invariants & edge cases* → *trade-offs* →
 ### Part I — Architecture
 1. [The Shared-Nothing Architecture](./01-shared-nothing.md) — threads, proactors, fibers, shards,
    and why Dragonfly has almost no locks.
+14. [Connection Management](./14-connection-management.md) — how client connections are accepted,
+    placed on threads, driven, throttled, and migrated.
 
 ### Part II — Data Structures & Memory
 2. [DashTable](./02-dashtable.md) — the hash table at the core of every shard, and how it enables

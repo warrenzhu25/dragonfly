@@ -41,6 +41,26 @@ evicting under memory pressure, and draining deferred work.
 data; it *coordinates* by sending messages to shards and awaiting their replies. Also called the
 connection fiber.
 
+**Listener.** The object that owns a listening socket on a port, accepts new connections, and assigns
+each to an owning thread. Listeners have roles — *main* (normal port), *privileged* (admin port), and
+*other* — where the privileged port stays reachable even when the main port refuses new clients.
+
+**Connection dispatch queue.** A per-connection queue of out-of-band work (pub/sub deliveries, monitor
+output, control and migration messages), drained by a lazily-started second fiber (the *async fiber*),
+separate from the connection's main read-and-dispatch loop.
+
+**Pipelining.** A client sending many commands before reading their replies. Dragonfly buffers the
+parsed commands and can *squash* runs of single-shard ones into parallel hops (see **hop** and
+[Chapter 4](./04-transactions.md)).
+
+**Backpressure.** Flow control that bounds memory: when a connection (or a per-thread pool of
+connections) buffers too much unfinished work, its read loop *parks* — stops pulling input — until the
+backlog drains. Also used to throttle publishers behind slow subscribers.
+
+**Connection migration.** Moving a live connection from one thread (proactor) to another — for load
+balancing, or to co-locate it with the shard whose data it keeps touching so its commands can run
+inline without a hop.
+
 **Hop.** One round trip from the coordinator to a set of shards and back: the coordinator posts a
 callback to each involved shard, the shards run it in parallel, and the coordinator waits for all of
 them. A simple `SET` is one hop; `RENAME` across shards is two.
