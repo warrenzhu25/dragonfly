@@ -104,6 +104,32 @@ There are two variants, differing in *which* value the hook captures:
   full-sync window. For replication, where the snapshot is immediately followed by a live change stream,
   finishing-time semantics are exactly right.
 
+### Where writes during a snapshot go
+
+A question this design invites — especially since Dragonfly has no append-only command log (no AOF, see
+[Chapter 8](./08-shard-serialization.md#there-is-no-aof-ordering-across-shards-without-a-global-log)) —
+is what happens to writes that arrive *while* a snapshot is running. The short answer: **they are never
+blocked.** The snapshot runs concurrently with live traffic, and a write that lands mid-snapshot is
+applied to the live in-memory table immediately, exactly like any other write. Snapshotting never
+queues, delays, or intercepts writes.
+
+The write hook does not change *where the write goes* — it goes into the live database as usual — it only
+ensures the write does not corrupt the in-flight snapshot, by capturing the entry's pre-cut image before
+the overwrite. So the write survives in the one place writes always survive: RAM, in the live table.
+
+Whether that write also appears in *this* snapshot depends on the flavor and timing. For a **conservative
+file backup**, a write after the cut is deliberately **not** in this file — a backup means "the database
+as of when it started." That write is not lost; it is in the live database and will be included in the
+**next** snapshot. For **relaxed replication**, writes during the snapshot **are** carried to the replica,
+because the pipeline streams them through the change hook and then tails the journal
+([Chapter 8](./08-shard-serialization.md)) — the replica misses nothing.
+
+The one real exposure follows directly from having no AOF: between two snapshots there is no on-disk
+record of writes, so an *unclean crash* loses writes made since the last completed snapshot. Dragonfly's
+answer to that is **replication** — a replica already holds those writes via the live journal stream, so
+you fail over — rather than replaying an fsync'd command log on restart. If you need a tighter durability
+window, the levers are more frequent snapshots and replicas, not an AOF.
+
 ---
 
 ## How it works: the output side
@@ -188,6 +214,10 @@ memory gamble.
   snapshot stays consistent without blocking writes.
 - **Conservative** mode records the image as of snapshot *start* (backups); **relaxed** mode records it
   as of *finish* (replication), avoiding a separate change-log.
+- **Writes during a snapshot are never blocked** — they apply to the live table immediately; the write
+  hook only captures the pre-cut image so the file stays consistent. Post-cut writes roll into the next
+  snapshot (backup) or stream to the replica (replication). With no AOF, an unclean crash loses writes
+  since the last snapshot — durability leans on frequent snapshots and replicas.
 - Output uses a channel plus **aligned buffers** for direct I/O; it can produce one combined file or one
   stream per shard.
 
