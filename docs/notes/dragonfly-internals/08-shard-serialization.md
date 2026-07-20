@@ -105,6 +105,42 @@ Two subtleties are worth naming:
   version to decide. Certain non-transactional deletes also need careful ordering relative to the cut so
   they are neither lost nor double-applied.
 
+### There is no AOF: ordering across shards without a global log
+
+A natural question for anyone coming from Redis: where is the append-only file (AOF), the single log
+that records every command in one total order? Dragonfly **does not have one**. There is no global,
+totally-ordered log of all commands, and — importantly — the journal just described is *per shard* and
+lives in memory (a bounded ring buffer streamed to replicas), not a durable on-disk command log.
+
+This is a deliberate consequence of the [shared-nothing design](./01-shared-nothing.md). A single global
+log would force every command from every core to funnel through one ordered sink, which is exactly the
+cross-core serialization the architecture exists to avoid. So instead of *centralizing* the order,
+Dragonfly *carries* it in the per-shard logs and *reconstructs* it on replay, using three ingredients:
+
+- **Per-shard order via LSN.** Each shard's journal stamps entries with a monotonically increasing LSN.
+  Within a shard — which is single-threaded — that LSN *is* the order, and it is unambiguous. A
+  single-shard command needs nothing more, because it never interacts with another shard.
+- **Cross-shard order via TxId.** The commands that genuinely need a machine-wide order — multi-shard
+  transactions — carry the global **TxId** from the transaction model ([Chapter 4](./04-transactions.md)).
+  When such a transaction runs, *each participating shard writes a journal entry stamped with the same
+  TxId*. The global order is therefore not stored in one file; it is encoded by the shared TxId appearing
+  in several independent per-shard logs.
+- **Reassembly at the consumer.** On the replica, the per-shard flows are recombined and keyed by TxId.
+  The first time a multi-shard TxId appears, the consumer records how many shards must participate, then
+  **waits until every participating shard's flow has delivered that TxId before executing the entries
+  atomically together** (global commands such as `FLUSHALL` use the same all-shard barrier). This barrier
+  is what reproduces the master's strict-serializable order across threads: a multi-shard transaction is
+  applied as one atomic unit, in TxId order relative to other transactions, exactly as it ran on the
+  master.
+
+Put together: local order comes from each shard's LSN, cross-shard atomicity and order come from the
+TxId tag, and the consumer's per-TxId barrier stitches them back into the same order the master executed
+— no global log required. One honest caveat follows from all this: because the journal is in-memory and
+durability is snapshot-based, Dragonfly's crash-durability is *not* equivalent to Redis with `appendonly`
+plus `fsync`. On an unclean crash you can lose writes made since the last snapshot; the journal exists to
+feed replicas (so failover is the availability story), not to be an fsync'd command log replayed on
+restart.
+
 ### Delayed serialization of tiered entries
 
 Some values are not in RAM at all — they have been offloaded to SSD (see
@@ -198,6 +234,10 @@ avoids that second buffer.
   applying.
 - **Tiered** values are serialized via async reads gated by a per-bucket latch, never blocking the shard.
 - A **backpressure** sink bounds memory when the consumer is slow.
+- **There is no AOF / global log.** Cross-thread total order is *carried* — per-shard **LSN** for local
+  order, the global **TxId** tag for multi-shard transactions — and *reconstructed* on the consumer via a
+  per-TxId barrier, not centralized in one file. Durability is snapshot-based, so this is not an fsync'd
+  command log.
 
 ---
 
