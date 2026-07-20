@@ -89,17 +89,59 @@ The net effect on memory is dramatic: where the Redis dict spends roughly 32 byt
 structure, DashTable's dense, pointerless slots spend a small fraction of that, and the savings grow as
 the table gets fuller.
 
-### Growth: split one segment, not the whole table
+### Growth: rehashing one segment at a time
 
-When a segment can hold no more (even after neighbor and stash probing), it **splits**. A new segment is
-allocated, the splitting segment's local depth increases by one, and its entries are redistributed
-between the two "buddy" segments according to the next hash bit. If the segment's local depth had
-already reached the global depth, the directory doubles first — a cheap pointer-array copy — and then
-the split proceeds.
+This is where DashTable differs most sharply from the Redis dict, so it is worth being precise about
+what "rehash" even means here. The Redis dict grows by allocating a second table and **incrementally
+moving every entry** from the old table to the new one over many subsequent operations — a table-wide
+rehash with a long-lived, half-migrated state. **DashTable never does this.** Growth is always confined
+to a single segment and happens in one shot, inside the insert that triggered it. There is no
+incremental-rehash state machine and no moment where the whole table is half-migrated — which is exactly
+what lets scans, snapshots, and expiry sweeps iterate safely while writes continue.
 
-The important part is the *bound*: a split touches one segment's worth of entries (hundreds), never the
-whole table (millions). There is no long incremental-rehash state machine and no moment where the table
-is half-migrated. This bounded, localized growth is what makes the next property possible.
+**First, try not to grow at all.** When an insert finds a key's home bucket full, the table works to
+make room *without* splitting. It uses the neighbor and stash buckets described above; it tries to
+*unload the stash* — moving previously-stashed entries back into regular buckets that have since freed
+up; and, in cache mode, if the policy forbids growth, it garbage-collects already-expired entries or
+evicts a victim instead. A split is the last resort, taken only when none of these free up space and the
+policy permits the table to grow.
+
+**Directory doubling comes first, and moves no data.** When a split is unavoidable, the segment's local
+depth must increase by one. If that segment's local depth already equals the global depth, the directory
+has to grow to make room for the finer distinction: the directory vector **doubles**, and each new slot
+is pointed at the existing segment it corresponds to. Crucially, **no entries move** during this step —
+it is a pointer-array copy. Afterward, several directory slots point at the same segment (local depth <
+global depth) until that segment itself splits.
+
+**The segment split is the actual rehash — and it touches only one segment.** A new "buddy" segment is
+allocated, both segments' local depth is bumped, and the source segment's entries are redistributed. The
+redistribution is deliberately cheap: for each entry, the table looks at the single newly-significant
+hash bit (the bit that the increased local depth now distinguishes). Entries whose bit says "the new
+side" are re-inserted into the buddy segment; the rest stay put. There is no re-hashing of keys across
+the table — just a one-bit test per entry, applied to the few hundred entries in the splitting segment.
+Everything else in the table is untouched. This is the *bound* that matters: a split is hundreds of
+entries, never millions.
+
+**Bucket versions are carried across the split.** There is a subtlety here that connects to snapshots
+(below): the per-bucket version counters that drive point-in-time snapshots do not automatically survive
+an entry moving from one bucket to another. So during a split, each destination bucket **inherits the
+source bucket's version**. This keeps an in-progress snapshot's "have I already captured this bucket?"
+reasoning correct even as the split relocates entries beneath it.
+
+**One pathological case, worth knowing.** The split decides sides using the top hash bits, so if a burst
+of inserts happens to share that prefix, they can all land on the *same* side and the split fails to
+relieve pressure (it just splits again). This is rare with real data — but Dragonfly's own replication
+can provoke it, because the snapshot stream is emitted in bucket order and so arrives as long runs of
+same-bucket-id entries. The behavior stays correct; it is simply a case where a single split does not
+halve occupancy.
+
+### Shrinking: merging buddy segments
+
+Growth has a mirror image. When deletions leave two buddy segments underfull, DashTable can **merge**
+them back into one, decreasing the local depth — and, when enough segments collapse, letting the
+directory itself shrink. Like a split, a merge is bounded to the two segments involved; it never rewrites
+the whole table. So the structure breathes in both directions — splitting one segment at a time as data
+grows, merging one pair at a time as data shrinks — and at no point is there a global rehash.
 
 ### Bucket versions: the key to forkless snapshots
 
@@ -203,8 +245,9 @@ implementation complexity for density and snapshot-friendliness.
   directory slots share a segment, making directory growth a cheap pointer copy.
 - **Buckets** hold 12 slots with a one-byte **fingerprint** per slot for fast, cache-friendly lookups;
   **neighbor** and **stash** buckets push occupancy high before a split.
-- Growth **splits a single segment** (hundreds of entries), never rehashing the whole table — bounded
-  cost and no half-migrated states.
+- Growth **splits a single segment** (hundreds of entries) using a one-bit hash test per entry, never
+  rehashing the whole table — bounded cost and no half-migrated states; the reverse **merges** buddy
+  segments as data shrinks. Bucket versions are carried across a split to keep snapshots consistent.
 - **Bucket versions** stamped on every mutation are the foundation of **forkless, point-in-time
   snapshots** and of replication.
 - DashTable is **denser** than a chained dict and iterates safely under concurrent mutation via a
