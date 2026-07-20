@@ -53,35 +53,14 @@ owns no data. It reaches shards only by posting callbacks to their fiber queues 
 replies. One such round trip — post to all involved shards, they run in parallel, wait for all — is a
 **hop**.
 
-A multi-shard transaction happens in two phases, each phase being one or more hops:
+A multi-shard transaction happens in two phases, each of which is one or more hops.
 
-```mermaid
-sequenceDiagram
-    participant C as Coordinator
-    participant S1 as Shard 1
-    participant S3 as Shard 3
-    Note over C,S3: Phase 1 - Schedule (reserve order, record intent)
-    par
-        C->>S1: reserve TxId slot, lock key a
-        S1-->>C: ack
-    and
-        C->>S3: reserve TxId slot, lock key b
-        S3-->>C: ack
-    end
-    Note over C,S3: Phase 2 - Execute (run callback, then release)
-    par
-        C->>S1: run callback on a, release
-        S1-->>C: ack
-    and
-        C->>S3: run callback on b, release
-        S3-->>C: ack
-    end
-    Note over C: reply OK to client
-```
-
-**Phase 1, Schedule:** the coordinator reserves the transaction a position in each shard's ordered
-queue and records that it intends to touch certain keys. **Phase 2, Execute:** each shard runs the
-actual work when the transaction reaches the front of its queue, then releases its hold.
+**Phase 1, Schedule:** the coordinator draws a global order number for the transaction, reserves it a
+position in each involved shard's ordered queue, and records on each shard that it intends to touch
+certain keys. The shards acknowledge in parallel. **Phase 2, Execute:** the coordinator asks every
+involved shard to run the actual work; each shard does so when the transaction reaches the front of
+its queue, and on the final hop releases its hold. The shards run in parallel, and only when all of
+them report done does the coordinator reply to the client.
 
 Only the coordinator *fiber* waits during all this. Its thread keeps running other fibers — other
 connections, other shards' work — so a "waiting" transaction stalls nothing.
@@ -327,39 +306,7 @@ otherwise-free "shard is the lock" guarantee can be lost, and it must be activel
 
 **Blocking commands hold their locks while they sleep.** `BLPOP`, `BRPOP`, and friends are the most
 intricate transaction type, because they must watch several keys across shards and wake the instant any
-of them gets data — all while preserving strict serializability. The mechanism:
-
-```mermaid
-sequenceDiagram
-    participant C1 as BLPOP coordinator
-    participant S1 as Shard 1 key X
-    participant S2 as Shard 2 key Y
-    participant C2 as LPUSH coordinator
-    Note over C1: BLPOP X Y 0
-    par check keys
-        C1->>S1: is X non-empty?
-        S1-->>C1: empty
-    and
-        C1->>S2: is Y non-empty?
-        S2-->>C1: empty
-    end
-    Note over C1: all empty, so suspend
-    par register watches
-        C1->>S1: watch X, leave tx-queue, keep locks
-    and
-        C1->>S2: watch Y, leave tx-queue, keep locks
-    end
-    Note over C1: fiber blocks, still holds intent locks on X and Y
-    Note over C2: another client runs LPUSH Y val
-    C2->>S2: push to Y
-    S2->>C1: notify, woken on key Y
-    par pop from wake key
-        C1->>S1: release locks on X
-    and
-        C1->>S2: pop Y, release locks
-    end
-    Note over C1: return Y and val
-```
+of them gets data — all while preserving strict serializability.
 
 The transaction schedules normally and checks its keys. If any key already has data, it pops and
 returns — no blocking. If all keys are empty, it runs a concluding hop that registers watches and
