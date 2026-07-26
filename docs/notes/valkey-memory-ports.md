@@ -21,7 +21,7 @@ already shipped in Valkey 8.
 |---|---|---|---|---|
 | 1 | **DenseSet** tagged-pointer sets/hashes | Container | **High** — ~2×, largely unexploited | Medium |
 | 2 | **B+tree sorted set** (order-statistics tree replacing the skiplist) | Container | **High** — up to ~15× less per-entry overhead (~37 → 2–3 B); ~40% on real zsets | High, self-contained |
-| 3 | **CompactObj** string encodings (ASCII-pack + Huffman) | Value object | **Medium** — real, but trades CPU | Low–Med |
+| 3 | **Compression**: string encodings (ASCII-pack + Huffman) *and* ZSTD **dictionary** compression of small list records | Value object / list | **Medium** — real, but trades CPU; list-dictionary is 3–4× on queues | Low–Med |
 | 4 | **DashTable** keyspace (fingerprints, dense slots) | Container | **Low** — Valkey 8 already did most of it | High |
 
 The rest of the document takes them in that order.
@@ -96,7 +96,12 @@ port (sorted sets are among the heaviest Redis/Valkey workloads), and it stacks 
 
 ---
 
-## Port 3 — CompactObj string encodings (ASCII-pack + Huffman)
+## Port 3 — Compression: string encodings and list dictionary compression
+
+Two related techniques from Dragonfly, both trading CPU for memory. The first shrinks individual string
+*values*; the second shrinks *small records inside lists* that are individually too small to compress.
+
+### 3a — CompactObj string encodings (ASCII-pack + Huffman)
 
 **The idea.** Dragonfly's value object (`CompactObj`, 18 bytes with a 16-byte inline payload) chooses a
 string encoding from a ladder (`src/core/compact_object.h:169-197`):
@@ -142,6 +147,39 @@ Concretely:
 **Recommendation:** ship **ASCII packing first** (cheap, deterministic, no trained state, no corpus
 risk), and treat **Huffman as opt-in** (`string-compression yes/no` + a trained-table path) for
 memory-bound, read-mostly deployments. This is a lower-effort, medium-reward companion to Port 1.
+
+### 3b — ZSTD dictionary compression for small list records
+
+**The idea** (Dragonfly blog: *How Dragonfly Cuts Celery & Sidekiq Queue Memory by 3–4×*). Small records
+— a few hundred bytes of JSON, say — are individually **too small for general-purpose compression** to
+help: the compressor has no history to exploit and the format overhead swamps the gain. But a *list* of
+such records (a job queue) is highly redundant *across* elements — they share keys, structure, and common
+substrings. Dragonfly trains a **ZSTD dictionary** from the records and compresses each element against
+it, so the shared structure is paid for once in the dictionary rather than per element. On Celery/Sidekiq
+queues this cut list memory by **3–4×**. It is gated by a minimum-size flag (below which compression is
+skipped) and is synchronous, so it can block the thread — explicitly experimental.
+
+**Why it is distinct from 3a.** ASCII/Huffman compress a value in isolation; the ZSTD *dictionary*
+captures redundancy *between* records. For queue-shaped data (many similar small payloads) the dictionary
+approach wins by a wide margin where per-value Huffman barely moves.
+
+**Valkey mapping.**
+
+- Applies to the **list** type (`t_list.c`, `quicklist`/`listpack`). When a list's malloc footprint
+  crosses a configurable threshold, train (or attach a preconfigured) ZSTD dictionary and store list
+  elements compressed; decompress on `LRANGE`/`LPOP`/`LINDEX`.
+- Dictionary lifecycle mirrors Huffman in 3a: train offline from a sample, or sample-and-train online for
+  a warming list; version the dictionary with the list so old elements remain decodable.
+- **Touch points:** `t_list.c` (all element read/pop paths decompress; push paths compress),
+  `quicklist.c` node handling, `objectComputeSize`, and RDB load/save.
+
+**The hard part.** Same single-threaded CPU caveat as 3a, sharpened: ZSTD decompression on every pop is
+heavier than a Huffman table lookup, and **synchronous compression can stall the event loop** on a large
+push (Dragonfly ships it as experimental for this reason). It suits **queue/log workloads** — high
+redundancy, whole-element access, throughput-tolerant — and should stay off for latency-critical lists.
+
+**Recommendation:** opt-in, list-only, off by default, aimed squarely at message-queue deployments
+(Celery/Sidekiq/BullMQ on Valkey) where the 3–4× is transformative and the CPU trade is acceptable.
 
 ---
 
@@ -203,10 +241,30 @@ keyspace is already competitive.
 
 Ports 1–3 are where the memory wins concentrate; Port 4 is a watch-list item, not a work item.
 
+## Surveyed and left out of scope
+
+The full Dragonfly engineering blog was reviewed; these are deliberately *not* ports, with the reason:
+
+- **Threading model / linear scaling, Swarm, cluster orchestration, RPS benchmarks** — architectural, and
+  premised on Dragonfly's shared-nothing multithreading. They do not map onto single-threaded Valkey as a
+  memory or per-op win.
+- **SSD data tiering** — a large subsystem, not a data-structure encoding; a separate project if ever.
+- **Search / vector (HNSW), faceted search, JSON** — module/feature territory (Valkey has its own module
+  path), not a memory-layout port.
+- **Inverted GEO index (R-Tree), Bloom filters, HyperLogLog, bitmaps, CL.THROTTLE rate limiting** —
+  feature-level capabilities. The R-Tree geo index is the most interesting as a *future* item, but it is a
+  new index type rather than a drop-in efficiency win, so it is a watch-list note, not a port here.
+- **Failover/HA, TLS, Terraform, control loops, cost/FinOps posts** — operational, not engine internals.
+
+The through-line: this note only tracks changes that are **self-contained data-structure or encoding
+swaps** delivering a memory (or clear per-op) win on a single-threaded engine. Everything above fails one
+of those tests.
+
 ## References
 
 - Dragonfly blog: [Dragonfly's New Sorted Set Implementation](https://www.dragonflydb.io/blog/dragonfly-new-sorted-set)
-  (Port 2 — B+tree, ~40% reduction, 2–3 B/entry).
+  (Port 2 — B+tree, ~40% reduction, 2–3 B/entry); *How Dragonfly Cuts Celery & Sidekiq Queue Memory by
+  3–4×* (Port 3b — ZSTD list dictionary compression).
 - Dragonfly chapters: [DenseSet](./dragonfly-internals/03-dense-set.md),
   [DashTable](./dragonfly-internals/02-dashtable.md),
   [CompactObj / zero-copy GET](./dragonfly-internals/06-zero-copy-get.md).
