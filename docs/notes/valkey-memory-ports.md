@@ -13,15 +13,16 @@ Memory efficiency in an in-memory store lives at two layers:
 - **The value object** — how each element's own bytes are stored. Overhead here is paid *per byte* of
   user data.
 
-Dragonfly attacks both. This note maps three of its ideas onto Valkey and is explicit that they are not
-equal bets: one is a large untapped win, one is a real but CPU-for-memory trade, and one is mostly
+Dragonfly attacks both. This note maps four of its ideas onto Valkey and is explicit that they are not
+equal bets: two are large untapped wins, one is a real but CPU-for-memory trade, and one is mostly
 already shipped in Valkey 8.
 
 | # | Port | Layer | Remaining upside for Valkey | Effort |
 |---|---|---|---|---|
 | 1 | **DenseSet** tagged-pointer sets/hashes | Container | **High** — ~2×, largely unexploited | Medium |
-| 2 | **CompactObj** string encodings (ASCII-pack + Huffman) | Value object | **Medium** — real, but trades CPU | Low–Med |
-| 3 | **DashTable** keyspace (fingerprints, dense slots) | Container | **Low** — Valkey 8 already did most of it | High |
+| 2 | **B+tree sorted set** (order-statistics tree replacing the skiplist) | Container | **High** — up to ~15× less per-entry overhead (~37 → 2–3 B); ~40% on real zsets | High, self-contained |
+| 3 | **CompactObj** string encodings (ASCII-pack + Huffman) | Value object | **Medium** — real, but trades CPU | Low–Med |
+| 4 | **DashTable** keyspace (fingerprints, dense slots) | Container | **Low** — Valkey 8 already did most of it | High |
 
 The rest of the document takes them in that order.
 
@@ -52,7 +53,50 @@ The port must gate the optimization on known-safe configurations and fall back t
 
 ---
 
-## Port 2 — CompactObj string encodings (ASCII-pack + Huffman)
+## Port 2 — B+tree sorted set (order-statistics tree)
+
+**The idea.** Dragonfly (v1.11+) replaced the sorted-set **skiplist** with a custom **B+tree**. A Redis/
+Valkey skiplist carries ~37 bytes of overhead per entry (a tower of forward pointers plus per-node
+metadata) on top of the ~16-byte `(member, score)` payload — ~56 bytes total. Dragonfly's B+tree packs
+up to **15 `(member, score)` pairs into a 256-byte node** (branching factor 7–15), so per-entry overhead
+falls to **2–3 bytes** — roughly an order of magnitude less, and about **40% total memory reduction** on
+real large sorted sets. Nodes are cache-friendly arrays rather than pointer-chased towers.
+
+The skiplist does one thing a plain B+tree does not: **rank** (`ZRANK`, `ZRANGEBYRANK`) in O(log n), via
+per-level span counts. Dragonfly's tree is therefore an **order-statistics B+tree** — each internal node
+stores its subtree element counts, so rank and rank-range queries stay logarithmic. That "custom
+functionality around the ranking API" is exactly why an off-the-shelf B+tree does not suffice.
+
+**Valkey mapping — and how it composes with Port 1.** A Valkey `zset` (`OBJ_ENCODING_SKIPLIST`) is
+already **two** structures: a `dict` (member → score) for O(1) `ZSCORE`/updates, and a `zskiplist`
+(score-ordered, with rank spans) for ranges and rank. Dragonfly's `SortedMap` has the identical split —
+a DenseSet-based `ScoreMap` plus a `BPTree` of `(score, member)` (`src/core/sorted_map.h:142-148`). So
+the port is surgical:
+
+- **Replace the `zskiplist` with an order-statistics B+tree** keyed by `(score, member)`; keep the
+  member→score map for point lookups.
+- The tree stores **pointers to the same `sds` `(score,member)` blobs** the map holds, so member bytes
+  are not duplicated across the two structures (as Dragonfly shares `ScoreSds` between them).
+- Better still, the map side is exactly **Port 1**: a large zset becomes DenseSet (map) + B+tree
+  (order) — the two container ports stack for a compounding memory win.
+- **Touch points** in `t_zset.c`: the `zsl*` family (`zslInsert`, `zslDelete`, `zslGetRank`,
+  `zslGetElementByRank`, `zslDeleteRangeByScore/ByRank/ByLex`, and the `ZRANGEBYSCORE`/`ZRANGEBYLEX`
+  iterators) is reimplemented over the tree; `dict` (or DenseSet) stays for `ZSCORE`/`ZADD` updates.
+
+**The hard part.** This is the most *code* of any port — a correct, augmented (subtree-count) B+tree with
+Valkey's full range/rank/lex semantics is a substantial, subtle structure, and it is on the hot path for
+every zset command, so it must match or beat the skiplist on CPU (it generally does: contiguous nodes are
+more cache-friendly than pointer towers, and rank via subtree counts is the same O(log n) as skiplist
+spans). Range **iteration** must expose a forward/backward cursor across leaves. But it is **fully
+self-contained** — no VA-tagging assumption, no fork/threading dependency — which makes it a clean,
+high-value port despite the volume.
+
+**Recommendation:** high priority, second only to DenseSet. The memory win is the largest of any single
+port (sorted sets are among the heaviest Redis/Valkey workloads), and it stacks with Port 1.
+
+---
+
+## Port 3 — CompactObj string encodings (ASCII-pack + Huffman)
 
 **The idea.** Dragonfly's value object (`CompactObj`, 18 bytes with a 16-byte inline payload) chooses a
 string encoding from a ladder (`src/core/compact_object.h:169-197`):
@@ -101,7 +145,7 @@ memory-bound, read-mostly deployments. This is a lower-effort, medium-reward com
 
 ---
 
-## Port 3 — DashTable-style keyspace
+## Port 4 — DashTable-style keyspace
 
 **The idea.** Dragonfly's main per-shard dictionary is a DashTable: dense, pointerless slots with a
 **one-byte fingerprint** per slot to reject non-matching keys without pointer-chasing, and
@@ -133,31 +177,39 @@ keyspace is already competitive.
 
 - **VA-width pointer-tag guard (Port 1).** The top-bit tagging is the shared prerequisite for DenseSet.
   Settle it first — a compile-time/runtime gate on virtual-address width with a `dict` fallback.
-- **Trained-table lifecycle (Port 2).** Huffman needs offline training tooling, a distribution format,
+- **Trained-table lifecycle (Port 3).** Huffman needs offline training tooling, a distribution format,
   a load path, and a "shrinks-or-skip" guard. ASCII packing needs none of this — prefer it as the
   default-on piece.
-- **Active defrag & memory accounting (Ports 1 and 2).** Both introduce new allocations (chain nodes;
-  compressed buffers) that `activeDefrag`, `MEMORY USAGE`, and `maxmemory` must understand.
-- **SCAN semantics (Port 1).** DenseSet displacement + resize must preserve Valkey's SCAN guarantee; a
-  cursor design is required, not just a data-structure swap.
+- **Hot-path CPU on one thread (Ports 2 and 3).** Valkey is single-threaded, so the B+tree (per zset
+  command) and any compression decode (per string access) must match or beat what they replace on CPU,
+  not just on bytes. The B+tree generally wins on cache behavior; compression is a genuine trade.
+- **Active defrag & memory accounting (Ports 1, 2, 3).** All introduce new allocations (chain nodes,
+  tree nodes, compressed buffers) that `activeDefrag`, `MEMORY USAGE`, and `maxmemory` must understand.
+- **SCAN / cursor semantics (Ports 1 and 2).** DenseSet displacement + resize must preserve Valkey's
+  SCAN guarantee; the B+tree must expose a stable forward/backward leaf cursor for range iteration.
 
 ## Suggested sequencing
 
 1. **DenseSet, phase 1** (Port 1): VA guard + core structure + `t_set.c` behind a flag; validate with
-   `MEMORY USAGE`. *Largest memory win, self-contained.*
-2. **ASCII packing** (Port 2): cheap, deterministic, no trained state. Ships the value-layer win with
+   `MEMORY USAGE`. *Largest per-member win, self-contained.*
+2. **B+tree sorted set** (Port 2): the biggest single memory win, and it reuses the DenseSet map from
+   step 1 on the point-lookup side. *Most code, but no shared prerequisites beyond Port 1.*
+3. **ASCII packing** (Port 3): cheap, deterministic, no trained state. Ships the value-layer win with
    minimal risk.
-3. **DenseSet, phases 2–3** (Port 1): SCAN cursor, incremental rehash, defrag hook; then extend to
+4. **DenseSet, phases 2–3** (Port 1): SCAN cursor, incremental rehash, defrag hook; then extend to
    `t_hash.c` with `DS_TTL_BIT`.
-4. **Huffman, opt-in** (Port 2): trainer + config gate for read-mostly, memory-bound deployments.
-5. **DashTable resize model** (Port 3): only if the rehash memory spike becomes a priority.
+5. **Huffman, opt-in** (Port 3): trainer + config gate for read-mostly, memory-bound deployments.
+6. **DashTable resize model** (Port 4): only if the rehash memory spike becomes a priority.
 
-Ports 1 and 2 are where the memory wins concentrate; Port 3 is a watch-list item, not a work item.
+Ports 1–3 are where the memory wins concentrate; Port 4 is a watch-list item, not a work item.
 
 ## References
 
+- Dragonfly blog: [Dragonfly's New Sorted Set Implementation](https://www.dragonflydb.io/blog/dragonfly-new-sorted-set)
+  (Port 2 — B+tree, ~40% reduction, 2–3 B/entry).
 - Dragonfly chapters: [DenseSet](./dragonfly-internals/03-dense-set.md),
   [DashTable](./dragonfly-internals/02-dashtable.md),
   [CompactObj / zero-copy GET](./dragonfly-internals/06-zero-copy-get.md).
 - Detailed Port 1 design: [`valkey-denseset-port.md`](./valkey-denseset-port.md).
-- Source: `src/core/dense_set.{h,cc}`, `src/core/compact_object.h`, `src/core/dash.h`.
+- Source: `src/core/dense_set.{h,cc}`, `src/core/sorted_map.h`, `src/core/bptree_set.h`,
+  `src/core/compact_object.h`, `src/core/dash.h`.
